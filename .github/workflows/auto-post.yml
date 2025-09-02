@@ -3,10 +3,15 @@ name: Auto Post (Free)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 4 * * *"   # 10:00 IST daily
+    - cron: "30 4 * * *"   # रोज़ सुबह 10 बजे IST
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  run:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -29,9 +34,18 @@ jobs:
           NEWS_QUERY: "Indian share market OR Sensex OR Nifty"
         run: python auto_news_instagram.py
 
-      - name: Publish to gh-pages (free hosting)
-        uses: peaceiris/actions-gh-pages@v3
+      - name: Upload artifact for Pages
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: gh-pages
-          publish_dir: out
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
