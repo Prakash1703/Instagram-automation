@@ -1,0 +1,37 @@
+name: Auto Post (Free)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * *"   # 10:00 IST daily
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate image + caption
+        env:
+          OUTPUT_DIR: out
+          BRAND_NAME: instanews
+          NEWS_QUERY: "Indian share market OR Sensex OR Nifty"
+        run: python auto_news_instagram.py
+
+      - name: Publish to gh-pages (free hosting)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: out
