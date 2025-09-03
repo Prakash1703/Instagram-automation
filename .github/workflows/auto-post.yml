@@ -3,7 +3,7 @@ name: Auto Post (Every 30 minutes)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # हर 30 मिनट (00, 30)
+    - cron: "*/30 * * * *"   # हर 30 मिनट (00 और 30 पर)
 
 permissions:
   contents: read
@@ -22,24 +22,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate image + caption
+      - name: Generate image + caption (Moneycontrol Hybrid Feed)
         env:
           OUTPUT_DIR: out
           BRAND_NAME: instanews
-          NEWS_QUERY: "Indian share market OR Sensex OR Nifty"
           NEWS_WINDOW_HOURS: "2"
         run: python auto_news_instagram.py
 
-      - name: Show output dir and print final URL
+      - name: Show output dir and print Final URL
         run: |
           ls -la out || true
           if [ -f out/url.txt ]; then
-            echo "FINAL_URL: $(cat out/url.txt)"
+            echo "====================================="
+            echo "FINAL IMAGE URL:"
+            cat out/url.txt
+            echo "====================================="
           else
             echo "No new news (skipped) or URL file missing."
           fi
