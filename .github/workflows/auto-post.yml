@@ -3,7 +3,7 @@ name: Auto Post (Every 30 minutes)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # हर 30 मिनट
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
@@ -27,13 +27,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Generate image + caption (Hybrid: Moneycontrol → Google → Fallback)
+      - name: Generate image + caption
         env:
           OUTPUT_DIR: out
           BRAND_NAME: instanews
-          NEWS_WINDOW_HOURS: "6"   # recent window बड़ा ताकि skip कम हो
-          FORCE_GENERATE: "1"      # duplicate safeguard OFF → हर run में इमेज बने
-          # GOOGLE_QUERY override करना चाहो तो यहाँ दे सकते हो
+          NEWS_WINDOW_HOURS: "6"
+          FORCE_GENERATE: "1"
         run: python auto_news_instagram.py
 
       - name: Show output dir and print Final URL
