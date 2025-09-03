@@ -16,7 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ---------- Settings ----------
 NEWS_QUERY = os.getenv("NEWS_QUERY", "Indian share market OR Sensex OR Nifty")
-NEWS_WINDOW_HOURS = int(os.getenv("NEWS_WINDOW_HOURS", "2"))   # ताज़ा खबरें
+NEWS_WINDOW_HOURS = int(os.getenv("NEWS_WINDOW_HOURS", "0.5"))   # ताज़ा खबरें
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "out")
 BRAND_NAME = os.getenv("BRAND_NAME", "instanews")
 BASE_URL_ENV = os.getenv("BASE_URL", "")  # लोकल में चाहें तो base URL यहीं दें
