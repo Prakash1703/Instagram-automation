@@ -21,7 +21,7 @@ FEEDS = [
     "https://www.moneycontrol.com/rss/marketreports.xml"    # Market Reports
 ]
 
-NEWS_WINDOW_HOURS = float(os.getenv("NEWS_WINDOW_HOURS", "1"))
+NEWS_WINDOW_HOURS = float(os.getenv("NEWS_WINDOW_HOURS", "2"))
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", "out")
 BRAND_NAME = os.getenv("BRAND_NAME", "instanews")
 BASE_URL_ENV = os.getenv("BASE_URL", "")
