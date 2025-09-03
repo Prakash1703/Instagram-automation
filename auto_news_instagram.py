@@ -128,8 +128,8 @@ def main():
         print("No news found in window; exiting.")
         return
 
-    # सबसे relevant पहला item
-    it = items[0]
+    # items में से सबसे latest (max published) चुनो
+    it = max(items, key=lambda x: x["published"])
     uid = hashlib.sha1((it["title"] + it["link"]).encode()).hexdigest()
     out_file = os.path.join(OUTPUT_DIR, f"{uid}.png")
 
