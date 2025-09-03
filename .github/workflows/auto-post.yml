@@ -3,7 +3,7 @@ name: Auto Post (Free)
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 4 * * *"   # रोज़ सुबह 10 बजे IST
+    - cron: "*/30 * * * *"
 
 permissions:
   contents: read
