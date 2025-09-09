@@ -3,17 +3,21 @@
 """
 Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style).
 
-Tweaks in this version:
-- Tries three image sources in order of quality:
-  1) Publisher page og:image/twitter:image (canonical page)
-  2) RSS media thumbnail (from Google News feed)
-  3) Google News page og:image (cached photo on news.google.com)
-- Allows googleusercontent/gstatic thumbnails (they are real cached photos)
-- Still filters obvious logos/placeholders and too-small images
-- Freshness + duplicate-safe + robust against corrupt last_id.json
+What’s inside:
+- Source: Google News Top Stories (India) or NEWS_QUERY search
+- Freshness gate via MAX_AGE_MINUTES (default 60)
+- Duplicate prevention via out/last_id.json (robust to empty/corrupt file)
+- Manual override via headline.txt
+- Resolves Google News link → publisher URL
+- Tries THREE image sources (in order) and picks best/large:
+  1) Publisher page: og:image / twitter:image / twitter:image:src / JSON-LD / <img>
+  2) RSS media thumbnail from Google News feed
+  3) Google News article page: og/image / twitter / JSON-LD
+- Filters obvious logo/icon/placeholder URLs; skips very tiny images
+- No URL printed on poster; subline shows "Publisher • Local Time (IST)"
 """
 
-import os, io, sys, json, hashlib, datetime as dt
+import os, io, json, hashlib, datetime as dt
 from urllib.parse import quote_plus, urlparse, urljoin
 from email.utils import parsedate_to_datetime
 
@@ -45,7 +49,6 @@ UA = {
     "Accept-Language": "en-IN,en;q=0.9"
 }
 
-# Generic-looking image URL hints
 BAD_IMG_HINTS = ("logo", "icon", "placeholder", "default", "sprite", "branding")
 
 # ---------------- Utils ----------------
@@ -53,6 +56,7 @@ def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
 
 def load_state():
+    """Return {} if state file missing/empty/corrupt."""
     try:
         if not os.path.exists(STATE_PATH):
             return {}
@@ -90,7 +94,7 @@ def looks_generic_url(u: str) -> bool:
     u = (u or "").lower()
     return any(h in u for h in BAD_IMG_HINTS)
 
-# ---------------- Fetch: Google News ----------------
+# ---------------- Google News fetch ----------------
 def fetch_gn_entries(max_items=12):
     url = GN_SEARCH(NEWS_QUERY) if NEWS_QUERY else GN_TOP
     d = feedparser.parse(url)
@@ -134,8 +138,41 @@ def resolve_canonical(url: str, timeout=12):
     except Exception:
         return url, None
 
+def _jsonld_pick_image(obj, base_url):
+    """Walk JSON-LD to find image/thumbnailUrl urls."""
+    def norm(u):
+        return urljoin(base_url, u) if u else None
+    if isinstance(obj, list):
+        for it in obj:
+            u = _jsonld_pick_image(it, base_url)
+            if u: return u
+        return None
+    if isinstance(obj, dict):
+        for key in ("image", "thumbnailUrl", "thumbnailURL"):
+            if key in obj:
+                v = obj[key]
+                if isinstance(v, str):
+                    return norm(v)
+                if isinstance(v, dict) and v.get("url"):
+                    return norm(v["url"])
+                if isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, str):
+                            return norm(it)
+                        if isinstance(it, dict) and it.get("url"):
+                            return norm(it["url"])
+        for key in ("mainEntityOfPage", "primaryImageOfPage"):
+            if key in obj:
+                u = _jsonld_pick_image(obj[key], base_url)
+                if u: return u
+        if "@graph" in obj:
+            return _jsonld_pick_image(obj["@graph"], base_url)
+    return None
+
 def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
-    """Try og:image / twitter:image / image_src / first <img> on a page."""
+    """
+    Try og:image / twitter:image / twitter:image:src / link rel=image_src / JSON-LD / first <img>.
+    """
     def from_soup(sp: BeautifulSoup):
         if not sp: return None
         for attr, val in (
@@ -143,6 +180,7 @@ def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
             ("property","og:image:secure_url"),
             ("name","twitter:image"),
             ("property","twitter:image"),
+            ("name","twitter:image:src"),
         ):
             tag = sp.find("meta", {attr: val})
             if tag and tag.get("content"):
@@ -150,6 +188,13 @@ def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
         tag = sp.find("link", rel="image_src")
         if tag and tag.get("href"):
             return urljoin(page_url, tag["href"])
+        for node in sp.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(node.string or node.text or "")
+            except Exception:
+                continue
+            u = _jsonld_pick_image(data, page_url)
+            if u: return u
         img = sp.find("img")
         if img and img.get("src"):
             return urljoin(page_url, img["src"])
@@ -158,30 +203,24 @@ def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
     img_url = from_soup(soup)
     if img_url:
         return img_url
-
     try:
         r = requests.get(page_url, headers=UA, timeout=timeout)
         if r.status_code == 200:
             sp = BeautifulSoup(r.text, "html.parser")
-            img_url = from_soup(sp)
-            if img_url:
-                return img_url
+            return from_soup(sp)
     except Exception:
         pass
     return None
 
 def extract_gnews_thumbnail(gnews_url: str, timeout=10):
-    """Fallback: take og:image from the news.google.com article page itself."""
+    """Fallback: use og/twitter/JSON-LD from the Google News article page itself."""
     try:
         r = requests.get(gnews_url, headers=UA, timeout=timeout)
         if r.status_code != 200: return None
         sp = BeautifulSoup(r.text, "html.parser")
-        tag = sp.find("meta", property="og:image")
-        if tag and tag.get("content"):
-            return tag["content"]
+        return extract_og_like(gnews_url, sp, timeout=0)
     except Exception:
         return None
-    return None
 
 def download_image(url: str, timeout=12):
     try:
@@ -198,7 +237,7 @@ def aspect_fit_fill(img: Image.Image, size):
     return ImageOps.fit(ImageOps.exif_transpose(img), size, method=Image.LANCZOS, centering=(0.5,0.5))
 
 def pick_best_image(urls):
-    """Download candidates; prefer the largest area; skip logos/placeholders and tiny images."""
+    """Download candidates; prefer largest area; skip logos/placeholders and very tiny images."""
     best = None; best_area = 0
     for u in urls:
         if not u:
@@ -207,7 +246,7 @@ def pick_best_image(urls):
         if img is None:
             continue
         w, h = img.size
-        if w < 360 or h < 240:     # icons/tiny → skip
+        if w < 300 or h < 200:   # allow smallish thumbnails but skip icons
             continue
         area = w * h
         if area > best_area:
@@ -313,18 +352,18 @@ def main():
 
     title, gnews_link = newest["title"], newest["link"]
 
-    # 1) publisher page + og:image
-    page_url, soup = resolve_canonical(gnews_link)
-    publisher = publisher_from_link(page_url)
-    pub_img_url = extract_og_like(page_url, soup)
+    # 1) Publisher page + og/image/json-ld
+    page_url, soup    = resolve_canonical(gnews_link)
+    publisher         = publisher_from_link(page_url)
+    pub_img_url       = extract_og_like(page_url, soup)
 
     # 2) RSS media thumbnail
-    rss_img_url = newest.get("rss_media_url")
+    rss_img_url       = newest.get("rss_media_url")
 
-    # 3) Google News page thumbnail (final fallback)
-    gnews_img_url = extract_gnews_thumbnail(gnews_link)
+    # 3) Google News page thumbnail (fallback)
+    gnews_img_url     = extract_gnews_thumbnail(gnews_link)
 
-    # pick best among the candidates
+    # Pick best
     bg_img = pick_best_image([pub_img_url, rss_img_url, gnews_img_url])
 
     # Render poster
@@ -332,18 +371,19 @@ def main():
     pub_local = pub.astimezone(ist).strftime("%I:%M %p")
     png = render_layout(title, publisher, pub_local, bg_img)
 
-    fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{hashlib.sha256((title+page_url).encode()).hexdigest()[:8]}.png"
+    nid = hashlib.sha256((title + page_url).encode()).hexdigest()[:16]
+    fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{nid[:8]}.png"
     fpath = os.path.join(OUT_DIR, fname)
     open(fpath, "wb").write(png)
 
     # Save state
     state.update({
+        "last_id": nid,
         "last_title": title,
         "last_link": page_url,
         "last_published_utc": pub.isoformat() if pub else "",
         "query": NEWS_QUERY or "top_stories",
-        "max_age_minutes": MAX_AGE_MINUTES,
-        "last_id": hashlib.sha256((title+page_url).encode()).hexdigest()[:16]
+        "max_age_minutes": MAX_AGE_MINUTES
     })
     save_state(state)
 
