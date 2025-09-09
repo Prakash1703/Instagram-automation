@@ -3,15 +3,14 @@
 """
 Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style).
 
-Highlights:
-- Top Stories (India) or NEWS_QUERY search
-- Freshness gate via MAX_AGE_MINUTES (default 60)
-- Duplicate prevention via out/last_id.json (robust even if file is empty/corrupt)
-- Manual override via headline.txt
-- Resolves Google News link to publisher page, extracts real og:image
-- Also considers RSS media thumbnail; chooses the better/larger image
-- Filters out logos/icons/placeholders; skips tiny images
-- No URL printed on poster; subline shows "Publisher • Local Time (IST)"
+Tweaks in this version:
+- Tries three image sources in order of quality:
+  1) Publisher page og:image/twitter:image (canonical page)
+  2) RSS media thumbnail (from Google News feed)
+  3) Google News page og:image (cached photo on news.google.com)
+- Allows googleusercontent/gstatic thumbnails (they are real cached photos)
+- Still filters obvious logos/placeholders and too-small images
+- Freshness + duplicate-safe + robust against corrupt last_id.json
 """
 
 import os, io, sys, json, hashlib, datetime as dt
@@ -46,9 +45,6 @@ UA = {
     "Accept-Language": "en-IN,en;q=0.9"
 }
 
-# Reject these hostnames when deciding if an image is generic/Google proxy
-REJECT_HOSTS = {"gvt1.com"}
-
 # Generic-looking image URL hints
 BAD_IMG_HINTS = ("logo", "icon", "placeholder", "default", "sprite", "branding")
 
@@ -57,7 +53,6 @@ def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
 
 def load_state():
-    """Return {} if last_id.json is missing/empty/corrupt."""
     try:
         if not os.path.exists(STATE_PATH):
             return {}
@@ -104,7 +99,6 @@ def fetch_gn_entries(max_items=12):
         title = (e.get("title") or "").strip()
         link  = (e.get("link")  or "").strip()
         pub   = parse_dt(e.get("published") or e.get("updated") or e.get("pubDate"))
-        # keep RSS media candidate too
         media_url = None
         if "media_content" in e and e.media_content:
             media_url = e.media_content[0].get("url")
@@ -122,14 +116,13 @@ def pick_newest(entries):
     valid.sort(key=lambda x: x["published_at"], reverse=True)
     return valid[0]
 
-# ---------------- Resolve & extract image ----------------
+# ---------------- Resolve & extract images ----------------
 def resolve_canonical(url: str, timeout=12):
-    """Follow Google News redirect to publisher article URL; return (final_url, soup)."""
+    """Follow Google News redirect → publisher article URL; return (final_url, soup)."""
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
         final_url = r.url
         soup = BeautifulSoup(r.text, "html.parser")
-        # Canonical/og:url improve final_url accuracy
         can = soup.find("link", rel="canonical")
         if can and can.get("href"):
             final_url = urljoin(final_url, can["href"])
@@ -141,8 +134,8 @@ def resolve_canonical(url: str, timeout=12):
     except Exception:
         return url, None
 
-def extract_best_image(page_url: str, soup: BeautifulSoup | None, timeout=12):
-    """Try og:image / twitter:image / image_src / first <img> on publisher page."""
+def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
+    """Try og:image / twitter:image / image_src / first <img> on a page."""
     def from_soup(sp: BeautifulSoup):
         if not sp: return None
         for attr, val in (
@@ -177,12 +170,22 @@ def extract_best_image(page_url: str, soup: BeautifulSoup | None, timeout=12):
         pass
     return None
 
+def extract_gnews_thumbnail(gnews_url: str, timeout=10):
+    """Fallback: take og:image from the news.google.com article page itself."""
+    try:
+        r = requests.get(gnews_url, headers=UA, timeout=timeout)
+        if r.status_code != 200: return None
+        sp = BeautifulSoup(r.text, "html.parser")
+        tag = sp.find("meta", property="og:image")
+        if tag and tag.get("content"):
+            return tag["content"]
+    except Exception:
+        return None
+    return None
+
 def download_image(url: str, timeout=12):
     try:
-        # Reject obvious infra hosts
-        if url and urlparse(url).netloc.lower() in REJECT_HOSTS:
-            return None
-        if looks_generic_url(url):
+        if not url or looks_generic_url(url):
             return None
         r = requests.get(url, timeout=timeout, stream=True, headers=UA)
         if r.status_code != 200:
@@ -200,13 +203,11 @@ def pick_best_image(urls):
     for u in urls:
         if not u:
             continue
-        if looks_generic_url(u):
-            continue
         img = download_image(u)
         if img is None:
             continue
         w, h = img.size
-        if w < 400 or h < 300:     # too small => likely logo/icon
+        if w < 360 or h < 240:     # icons/tiny → skip
             continue
         area = w * h
         if area > best_area:
@@ -312,43 +313,47 @@ def main():
 
     title, gnews_link = newest["title"], newest["link"]
 
-    # Resolve Google News → publisher
+    # 1) publisher page + og:image
     page_url, soup = resolve_canonical(gnews_link)
     publisher = publisher_from_link(page_url)
+    pub_img_url = extract_og_like(page_url, soup)
 
-    nid = hashlib.sha256(f"{title}|{page_url}".encode()).hexdigest()[:16]
-    if state.get("last_id") == nid:
-        print("DUPLICATE_SKIP"); return
-
-    # IMAGE: publisher og:image + RSS media → pick best
-    pub_img_url = extract_best_image(page_url, soup)
+    # 2) RSS media thumbnail
     rss_img_url = newest.get("rss_media_url")
-    bg_img = pick_best_image([pub_img_url, rss_img_url])
+
+    # 3) Google News page thumbnail (final fallback)
+    gnews_img_url = extract_gnews_thumbnail(gnews_link)
+
+    # pick best among the candidates
+    bg_img = pick_best_image([pub_img_url, rss_img_url, gnews_img_url])
 
     # Render poster
     ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
     pub_local = pub.astimezone(ist).strftime("%I:%M %p")
     png = render_layout(title, publisher, pub_local, bg_img)
 
-    fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{nid[:8]}.png"
+    fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{hashlib.sha256((title+page_url).encode()).hexdigest()[:8]}.png"
     fpath = os.path.join(OUT_DIR, fname)
     open(fpath, "wb").write(png)
 
     # Save state
     state.update({
-        "last_id": nid,
         "last_title": title,
-        "last_link": page_url,   # store publisher URL (not gnews)
+        "last_link": page_url,
         "last_published_utc": pub.isoformat() if pub else "",
         "query": NEWS_QUERY or "top_stories",
-        "max_age_minutes": MAX_AGE_MINUTES
+        "max_age_minutes": MAX_AGE_MINUTES,
+        "last_id": hashlib.sha256((title+page_url).encode()).hexdigest()[:16]
     })
     save_state(state)
 
     print(f"[OK] Fresh image saved: {fpath}")
     print(f"[INFO] Title: {title}")
     print(f"[INFO] Publisher URL: {page_url}")
-    print(f"[INFO] RSS Media: {rss_img_url}")
+    print(f"[INFO] Img candidates:")
+    print(f"  publisher: {pub_img_url}")
+    print(f"  rss:       {rss_img_url}")
+    print(f"  gnews:     {gnews_img_url}")
     print(f"[INFO] Age: {age_min:.1f} minutes")
 
 if __name__ == "__main__":
