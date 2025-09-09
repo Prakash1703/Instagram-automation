@@ -1,100 +1,94 @@
 #!/usr/bin/env python3
 """
-Generate Instagram-ready image ONLY IF the news is really fresh.
-- Aggregates from multiple RSS feeds (moneycontrol + livemint + google news markets)
-- Picks the newest by published time
+Generate Instagram-ready PNG from the *latest* Google News item (any topic).
+- Source: Google News Top Stories (India) + optional query
+- Picks newest by publish time
 - Skips if older than MAX_AGE_MINUTES
-- Skips if duplicate of last posted
+- Skips if duplicate (title+link hash)
 - Optional manual override via headline.txt
-Outputs: ./out/<file>.png (1080x1350)
+
+ENV (optional):
+  NEWS_QUERY        -> if set, uses GN search RSS instead of Top Stories (e.g., "technology" or "nepal protests")
+  MAX_AGE_MINUTES   -> freshness window in minutes (default: 60)
+
+Outputs:
+  out/<timestamp>_<slug>_<hash>.png  (1080x1350, portrait)
+  out/last_id.json                    (state to prevent duplicates)
 """
 
-import os, io, json, hashlib, datetime as dt, sys
-from typing import List, Dict, Any, Optional
+import os, io, json, sys, hashlib, datetime as dt
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+
 import feedparser
 from slugify import slugify
 from PIL import Image, ImageDraw, ImageFont
-from email.utils import parsedate_to_datetime
 
-# ===== Config =====
+# ---------------- Config ----------------
 OUT_DIR = "out"
-STATE_PATH = "out/last_id.json"
+STATE_PATH = os.path.join(OUT_DIR, "last_id.json")
 OVERRIDE_PATH = "headline.txt"
-IMG_W, IMG_H = 1080, 1350
-MAX_LEN = 160
-MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", "60"))  # 👈 tweak via workflow env
 
-SOURCES = [
-    # Moneycontrol Top News
-    "https://www.moneycontrol.com/rss/MCtopnews.xml",
-    # LiveMint Markets (official RSS list has /rss/markets)
-    "https://www.livemint.com/rss/markets",
-    # Google News search (markets india)
-    "https://news.google.com/rss/search?q=markets+india&hl=en-IN&gl=IN&ceid=IN:en",
-]
+IMG_W, IMG_H = 1080, 1350      # Instagram portrait
+HEADLINE_WRAP_LEN = 160
+DEFAULT_MAX_AGE_MIN = 60
 
-# ====== Helpers ======
-def load_state() -> Dict[str, Any]:
+NEWS_QUERY = os.getenv("NEWS_QUERY", "").strip()
+MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", str(DEFAULT_MAX_AGE_MIN)))
+
+GN_TOP_STORIES = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
+GN_SEARCH = lambda q: f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+# --------------- Utilities ---------------
+def ensure_dirs():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+def load_state():
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-def save_state(state: Dict[str, Any]) -> None:
-    os.makedirs(OUT_DIR, exist_ok=True)
+def save_state(state):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def parse_dt(s: Optional[str]) -> Optional[dt.datetime]:
+def parse_dt(s):
+    """Parse RFC822-style pubDate to aware UTC datetime."""
     if not s:
         return None
     try:
-        d = parsedate_to_datetime(s)  # returns aware dt (usually UTC)
+        d = parsedate_to_datetime(s)
         if d.tzinfo is None:
             d = d.replace(tzinfo=dt.timezone.utc)
         return d.astimezone(dt.timezone.utc)
     except Exception:
         return None
 
-def get_entries(feed_url: str, max_items: int = 5) -> List[Dict[str, Any]]:
-    d = feedparser.parse(feed_url)
+def fetch_gn_entries(max_items=8):
+    """Fetch Google News feed (Top Stories or Search) and return entries with timestamps."""
+    url = GN_SEARCH(NEWS_QUERY) if NEWS_QUERY else GN_TOP_STORIES
+    d = feedparser.parse(url)
     entries = []
     for e in d.entries[:max_items]:
         title = e.get("title", "").strip()
         link  = e.get("link", "").strip()
-        # Try best-effort timestamps
-        p = e.get("published") or e.get("updated") or e.get("pubDate")
-        ts = parse_dt(p)
-        # If still None, try feedparser's struct_times
-        if ts is None:
-            for key in ("published_parsed", "updated_parsed"):
-                st = e.get(key)
-                if st:
-                    ts = dt.datetime(*st[:6], tzinfo=dt.timezone.utc)
-                    break
-        entries.append({
-            "title": title,
-            "link": link,
-            "published_at": ts,   # UTC aware or None
-            "source": feed_url,
-            "raw_published": p or "",
-        })
+        # GN provides 'published' (e.g., "Mon, 09 Sep 2025 16:10:00 GMT")
+        pub = parse_dt(e.get("published") or e.get("updated") or e.get("pubDate"))
+        entries.append({"title": title, "link": link, "published_at": pub})
     return entries
 
-def pick_newest(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    valid = [x for x in entries if x.get("published_at") is not None]
-    if not valid:
+def pick_newest(entries):
+    entries = [x for x in entries if x["published_at"] is not None]
+    if not entries:
         return None
-    valid.sort(key=lambda x: x["published_at"], reverse=True)
-    return valid[0]
+    entries.sort(key=lambda x: x["published_at"], reverse=True)
+    return entries[0]
 
-def hash_id(title: str, link: str) -> str:
-    return hashlib.sha256(f"{title}|{link}".encode("utf-8")).hexdigest()[:16]
+def short(text, n):
+    return text if len(text) <= n else text[: n - 1] + "…"
 
-def shorten(text: str, n: int) -> str:
-    return text if len(text) <= n else text[:n-1] + "…"
-
-def wrap_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int):
+def wrap_lines(draw, text, font, max_width):
     words = text.split()
     lines, line = [], ""
     for w in words:
@@ -102,116 +96,110 @@ def wrap_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int):
         if draw.textlength(test, font=font) <= max_width:
             line = test
         else:
-            if line: lines.append(line)
+            if line:
+                lines.append(line)
             line = w
-    if line: lines.append(line)
+    if line:
+        lines.append(line)
     return lines
 
-def draw_poster(headline: str, subline: str = "") -> bytes:
+def draw_poster(headline, subline=""):
     img = Image.new("RGB", (IMG_W, IMG_H), (18, 22, 33))
     draw = ImageDraw.Draw(img)
-    # header
+
+    # Header band
     draw.rectangle((0, 0, IMG_W, 260), fill=(34, 40, 60))
-    # fonts
+
+    # Fonts
     try:
-        h1 = ImageFont.truetype("DejaVuSans-Bold.ttf", 64)
+        h1   = ImageFont.truetype("DejaVuSans-Bold.ttf", 64)
         body = ImageFont.truetype("DejaVuSans.ttf", 42)
-        tag  = ImageFont.truetype("DejaVuSans.ttf", 28)
-        subf = ImageFont.truetype("DejaVuSans.ttf", 28)
+        meta = ImageFont.truetype("DejaVuSans.ttf", 28)
     except:
-        h1 = body = tag = subf = ImageFont.load_default()
+        h1 = body = meta = ImageFont.load_default()
 
-    # heading
-    heading = "MARKET UPDATE"
-    w = draw.textlength(heading, font=h1)
-    draw.text(((IMG_W - w) / 2, 110), heading, fill=(240, 245, 255), font=h1)
+    # Title
+    heading = "TOP STORY"
+    tw = draw.textlength(heading, font=h1)
+    draw.text(((IMG_W - tw) / 2, 110), heading, fill=(240, 245, 255), font=h1)
 
-    # box
+    # Card
     draw.rounded_rectangle((40, 270, IMG_W - 40, IMG_H - 180),
                            radius=36, outline=(80, 90, 120), width=3)
 
-    # headline
+    # Headline
     margin = 90
-    text = shorten(headline, MAX_LEN)
+    text = short(headline, HEADLINE_WRAP_LEN)
     lines = wrap_lines(draw, text, body, IMG_W - 2 * margin)
     y = 360
     for ln in lines:
-        wln = draw.textlength(ln, font=body)
-        draw.text(((IMG_W - wln) / 2, y), ln, fill=(235, 238, 245), font=body)
+        lw = draw.textlength(ln, font=body)
+        draw.text(((IMG_W - lw) / 2, y), ln, fill=(235, 238, 245), font=body)
         y += 64
 
-    # subline (optional)
+    # Subline (optional)
     if subline:
-        w3 = draw.textlength(subline, font=subf)
-        draw.text(((IMG_W - w3) / 2, y + 8), subline, fill=(210, 215, 230), font=subf)
+        sw = draw.textlength(subline, font=meta)
+        draw.text(((IMG_W - sw) / 2, y + 8), subline, fill=(210, 215, 230), font=meta)
 
-    # footer
-    now_ist = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30)))
-    footer = f"Auto-generated • {now_ist.strftime('%d %b %Y, %I:%M %p IST')}"
-    w2 = draw.textlength(footer, font=tag)
-    draw.text(((IMG_W - w2) / 2, IMG_H - 120), footer, fill=(210, 215, 230), font=tag)
+    # Footer (IST)
+    ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    footer = f"Auto-generated • {dt.datetime.now(ist).strftime('%d %b %Y, %I:%M %p IST')}"
+    fw = draw.textlength(footer, font=meta)
+    draw.text(((IMG_W - fw) / 2, IMG_H - 120), footer, fill=(210, 215, 230), font=meta)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
+# --------------- Main --------------------
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
+    ensure_dirs()
     state = load_state()
 
-    # 1) Manual override
+    # 1) Manual override via headline.txt
     if os.path.exists(OVERRIDE_PATH):
         with open(OVERRIDE_PATH, "r", encoding="utf-8") as f:
-            headline = f.read().strip()
-        if headline:
-            img = draw_poster(headline, "Manual override")
-            fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(headline)[:48]}_manual.png"
-            fpath = os.path.join(OUT_DIR, fname)
-            with open(fpath, "wb") as out:
-                out.write(img)
-            print("[OK] Manual override image saved:", fpath)
-            # manual overrides are allowed even if duplicate
-            state["last_id"] = "manual_" + hash_id(headline, "manual")
+            override = f.read().strip()
+        if override:
+            png = draw_poster(override, "Manual override")
+            fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(override)[:48]}_manual.png"
+            path = os.path.join(OUT_DIR, fname)
+            with open(path, "wb") as out:
+                out.write(png)
+            state["last_id"] = "manual_" + hashlib.sha256(override.encode()).hexdigest()[:16]
             save_state(state)
+            print("[OK] Manual override image:", path)
             return
 
-    # 2) Aggregate all sources, pick newest
-    all_entries = []
-    for url in SOURCES:
-        try:
-            all_entries.extend(get_entries(url, max_items=5))
-        except Exception as e:
-            print(f"[WARN] Failed to fetch {url}: {e}")
-
-    newest = pick_newest(all_entries)
+    # 2) Fetch latest from Google News
+    entries = fetch_gn_entries(max_items=12)
+    newest = pick_newest(entries)
     if not newest:
         print("NO_NEWS_FOUND")
-        sys.exit(0)
+        return
 
-    # 3) Freshness check
+    pub = newest["published_at"]          # aware UTC
     now = dt.datetime.now(dt.timezone.utc)
-    pub = newest.get("published_at")
-    if not pub:
-        print("NO_PUBLISH_TIME_SKIP")
-        sys.exit(0)
     age_min = (now - pub).total_seconds() / 60.0
+
+    # 3) Freshness filter
     if age_min > MAX_AGE_MINUTES:
         print(f"STALE_NEWS_SKIP age={age_min:.1f} min (> {MAX_AGE_MINUTES})")
-        sys.exit(0)
+        return
 
-    title = newest["title"]
-    link  = newest["link"]
-    raw_p = newest.get("raw_published", "")
-    nid = hash_id(title, link)
+    title, link = newest["title"], newest["link"]
 
     # 4) Duplicate check
+    nid = hashlib.sha256(f"{title}|{link}".encode()).hexdigest()[:16]
     if state.get("last_id") == nid:
         print("DUPLICATE_SKIP")
-        sys.exit(0)
+        return
 
     # 5) Render poster
-    subline = f"{link} • {pub.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30))).strftime('%I:%M %p')}"
-    png = draw_poster(title, subline=subline)
+    ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    sub = f"{link} • {pub.astimezone(ist).strftime('%I:%M %p')}"
+    png = draw_poster(title, subline=sub)
 
     fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{nid[:8]}.png"
     fpath = os.path.join(OUT_DIR, fname)
@@ -219,17 +207,20 @@ def main():
         f.write(png)
 
     # 6) Save state
-    state["last_id"] = nid
-    state["last_title"] = title
-    state["last_link"] = link
-    state["last_published_utc"] = pub.isoformat()
-    state["source"] = newest["source"]
+    state.update({
+        "last_id": nid,
+        "last_title": title,
+        "last_link": link,
+        "last_published_utc": pub.isoformat(),
+        "query": NEWS_QUERY or "top_stories",
+        "max_age_minutes": MAX_AGE_MINUTES
+    })
     save_state(state)
 
     print(f"[OK] Fresh image saved: {fpath}")
     print(f"[INFO] Title: {title}")
     print(f"[INFO] Link:  {link}")
-    print(f"[INFO] Pub:   {pub.isoformat()} (UTC)")
+    print(f"[INFO] Pub:   {pub.isoformat()} UTC")
     print(f"[INFO] Age:   {age_min:.1f} minutes")
 
 if __name__ == "__main__":
