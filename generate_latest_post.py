@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style)
+Google News → Latest only → Poster (Top text + bottom news photo)
 
-Key features:
-- Source: Google News Top Stories (India) OR NEWS_QUERY search
-- Freshness via MAX_AGE_MINUTES (default 60)
-- Duplicate-safe via out/last_id.json (robust even if file is empty/corrupt)
-- Manual override via headline.txt
-- Resolves Google News link → Publisher URL
-- Image candidates (priority order):
-    1) Publisher page (og:image / twitter:image / twitter:image:src / JSON-LD / <img>)
-    2) RSS media thumbnail (from the feed)
-    3) Google News article page image (og/twitter/JSON-LD)
-  -> Pick best per-source, prefer Publisher > RSS > GNews
-  -> Skip branding/logo/placeholder and very tiny images
+Features:
+- Fresh-only (MAX_AGE_MINUTES), duplicate-safe (out/last_id.json robust)
+- Google News link → publisher URL (canonical)
+- Image candidates with strong priority:
+    1) Publisher page: og/twitter/twitter:src/JSON-LD/<img>
+    1b) AMP page: largest <amp-img>/<img>
+    2) RSS media thumbnail
+    2b) GDELT Doc API image (free, no key)
+    3) Google News page og/twitter/JSON-LD
+  -> Prefer Publisher/AMP > RSS/GDELT > GNews
+  -> Skip branding/logo/placeholder; tiny images ignored
+- No URL printed on poster (only “Publisher • Local Time”)
 """
 
 import os, io, json, hashlib, datetime as dt
@@ -185,9 +185,7 @@ def _jsonld_pick_image(obj, base_url):
     return None
 
 def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
-    """
-    Try og:image / twitter:image / twitter:image:src / link rel=image_src / JSON-LD / first <img>.
-    """
+    """Try og/twitter/twitter:src/link rel=image_src/JSON-LD/first <img> on a page."""
     def from_soup(sp: BeautifulSoup):
         if not sp: return None
         for attr, val in (
@@ -227,6 +225,45 @@ def extract_og_like(page_url: str, soup: BeautifulSoup | None, timeout=12):
         pass
     return None
 
+def extract_from_amp(page_url: str, timeout=10):
+    """Find AMP page then pull largest <amp-img>/<img>."""
+    try:
+        r = requests.get(page_url, headers=UA, timeout=timeout)
+        if r.status_code != 200: 
+            return None
+        sp = BeautifulSoup(r.text, "html.parser")
+        amp = sp.find("link", rel=lambda v: v and "amphtml" in v)
+        if not amp or not amp.get("href"):
+            return None
+        amp_url = urljoin(page_url, amp["href"])
+
+        ra = requests.get(amp_url, headers=UA, timeout=timeout)
+        if ra.status_code != 200:
+            return None
+        sa = BeautifulSoup(ra.text, "html.parser")
+
+        cand = []
+        for tag in sa.find_all(["amp-img", "img"]):
+            src = None
+            if tag.get("srcset"):
+                parts = [p.strip().split(" ")[0] for p in tag["srcset"].split(",") if p.strip()]
+                if parts:
+                    src = parts[-1]
+            if not src:
+                src = tag.get("src")
+            if src:
+                cand.append(urljoin(amp_url, src))
+
+        for u in reversed(cand):
+            if looks_generic_url(u) or is_gnews_logo(u):
+                continue
+            img = download_image(u)
+            if img and img.size[0] >= 300 and img.size[1] >= 200:
+                return u
+    except Exception:
+        return None
+    return None
+
 def extract_gnews_thumbnail(gnews_url: str, timeout=10):
     """Fallback: use og/twitter/JSON-LD from the Google News article page itself."""
     try:
@@ -236,6 +273,27 @@ def extract_gnews_thumbnail(gnews_url: str, timeout=10):
         return extract_og_like(gnews_url, sp, timeout=0)
     except Exception:
         return None
+
+def fetch_gdelt_image(query_title: str, timeout=10):
+    """Free fallback: GDELT Doc API image for matching headline."""
+    try:
+        q = quote_plus(query_title)
+        url = f"https://api.gdeltproject.org/api/v2/doc/doc?query={q}&mode=ArtList&maxrecords=10&format=json"
+        r = requests.get(url, headers=UA, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        arts = data.get("articles") or []
+        for a in arts:
+            u = a.get("image")
+            if not u or looks_generic_url(u) or is_gnews_logo(u):
+                continue
+            img = download_image(u)
+            if img and img.size[0] >= 300 and img.size[1] >= 200:
+                return u
+    except Exception:
+        return None
+    return None
 
 def download_image(url: str, timeout=12):
     try:
@@ -254,11 +312,8 @@ def aspect_fit_fill(img: Image.Image, size):
 def pick_best_image(candidates):
     """
     candidates: list of tuples [(url, 'publisher'|'rss'|'gnews'), ...]
-    Strategy:
-      - Download & keep best (largest) per-source
-      - Prefer publisher > rss > gnews
-      - Penalize google-hosted images so publisher wins when comparable
-      - Skip logos/placeholders and tiny images
+    Prefer publisher > rss > gnews, pick largest per source.
+    Penalize google-hosted images so publisher wins when comparable.
     """
     best = {"publisher": (0, None), "rss": (0, None), "gnews": (0, None)}
 
@@ -273,7 +328,7 @@ def pick_best_image(candidates):
             continue
 
         w, h = img.size
-        if w < 300 or h < 200:   # icons/tiny → skip
+        if w < 300 or h < 200:
             continue
 
         area = w * h
@@ -394,16 +449,24 @@ def main():
     publisher      = publisher_from_link(page_url)
     pub_img_url    = extract_og_like(page_url, soup)
 
+    # 1b) AMP page (treat as publisher-quality)
+    amp_img_url    = extract_from_amp(page_url)
+
     # 2) RSS media thumbnail
     rss_img_url    = newest.get("rss_media_url")
+
+    # 2b) GDELT fallback by title
+    gdelt_img_url  = fetch_gdelt_image(title)
 
     # 3) Google News page fallback
     gnews_img_url  = extract_gnews_thumbnail(gnews_link)
 
-    # Priority-based pick
+    # Priority-based pick: Publisher/AMP > RSS/GDELT > GNews
     candidates = [
         (pub_img_url,   "publisher"),
+        (amp_img_url,   "publisher"),
         (rss_img_url,   "rss"),
+        (gdelt_img_url, "rss"),
         (gnews_img_url, "gnews"),
     ]
     bg_img = pick_best_image(candidates)
@@ -434,7 +497,9 @@ def main():
     print(f"[INFO] Publisher URL: {page_url}")
     print(f"[INFO] Img candidates:")
     print(f"  publisher: {pub_img_url}")
+    print(f"  amp:       {amp_img_url}")
     print(f"  rss:       {rss_img_url}")
+    print(f"  gdelt:     {gdelt_img_url}")
     print(f"  gnews:     {gnews_img_url}")
     print(f"[INFO] Age: {age_min:.1f} minutes")
 
