@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style).
+Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style)
 
-What’s inside:
-- Source: Google News Top Stories (India) or NEWS_QUERY search
-- Freshness gate via MAX_AGE_MINUTES (default 60)
-- Duplicate prevention via out/last_id.json (robust to empty/corrupt file)
+Key features:
+- Source: Google News Top Stories (India) OR NEWS_QUERY search
+- Freshness via MAX_AGE_MINUTES (default 60)
+- Duplicate-safe via out/last_id.json (robust even if file is empty/corrupt)
 - Manual override via headline.txt
-- Resolves Google News link → publisher URL
-- Tries THREE image sources (in order) and picks best/large:
-  1) Publisher page: og:image / twitter:image / twitter:image:src / JSON-LD / <img>
-  2) RSS media thumbnail from Google News feed
-  3) Google News article page: og/image / twitter / JSON-LD
-- Filters obvious logo/icon/placeholder URLs; skips very tiny images
-- No URL printed on poster; subline shows "Publisher • Local Time (IST)"
+- Resolves Google News link → Publisher URL
+- Image candidates (priority order):
+    1) Publisher page (og:image / twitter:image / twitter:image:src / JSON-LD / <img>)
+    2) RSS media thumbnail (from the feed)
+    3) Google News article page image (og/twitter/JSON-LD)
+  -> Pick best per-source, prefer Publisher > RSS > GNews
+  -> Skip branding/logo/placeholder and very tiny images
 """
 
 import os, io, json, hashlib, datetime as dt
@@ -93,6 +93,21 @@ def publisher_from_link(link: str) -> str:
 def looks_generic_url(u: str) -> bool:
     u = (u or "").lower()
     return any(h in u for h in BAD_IMG_HINTS)
+
+def host_of(u: str) -> str:
+    try:
+        return urlparse(u).netloc.lower()
+    except Exception:
+        return ""
+
+def is_gnews_logo(u: str) -> bool:
+    """Skip Google News branding/logo images on news.google.com pages."""
+    u = (u or "").lower()
+    h = host_of(u)
+    if "news.google.com" in h:
+        if "/images/branding/" in u or "news_icon" in u or "logo" in u:
+            return True
+    return False
 
 # ---------------- Google News fetch ----------------
 def fetch_gn_entries(max_items=12):
@@ -224,7 +239,7 @@ def extract_gnews_thumbnail(gnews_url: str, timeout=10):
 
 def download_image(url: str, timeout=12):
     try:
-        if not url or looks_generic_url(url):
+        if not url or looks_generic_url(url) or is_gnews_logo(url):
             return None
         r = requests.get(url, timeout=timeout, stream=True, headers=UA)
         if r.status_code != 200:
@@ -236,22 +251,44 @@ def download_image(url: str, timeout=12):
 def aspect_fit_fill(img: Image.Image, size):
     return ImageOps.fit(ImageOps.exif_transpose(img), size, method=Image.LANCZOS, centering=(0.5,0.5))
 
-def pick_best_image(urls):
-    """Download candidates; prefer largest area; skip logos/placeholders and very tiny images."""
-    best = None; best_area = 0
-    for u in urls:
-        if not u:
+def pick_best_image(candidates):
+    """
+    candidates: list of tuples [(url, 'publisher'|'rss'|'gnews'), ...]
+    Strategy:
+      - Download & keep best (largest) per-source
+      - Prefer publisher > rss > gnews
+      - Penalize google-hosted images so publisher wins when comparable
+      - Skip logos/placeholders and tiny images
+    """
+    best = {"publisher": (0, None), "rss": (0, None), "gnews": (0, None)}
+
+    for url, src in candidates:
+        if not url:
             continue
-        img = download_image(u)
+        if looks_generic_url(url) or is_gnews_logo(url):
+            continue
+
+        img = download_image(url)
         if img is None:
             continue
+
         w, h = img.size
-        if w < 300 or h < 200:   # allow smallish thumbnails but skip icons
+        if w < 300 or h < 200:   # icons/tiny → skip
             continue
+
         area = w * h
-        if area > best_area:
-            best, best_area = img, area
-    return best
+        hst = host_of(url)
+        penalty = 0.6 if ("googleusercontent" in hst or "gstatic" in hst or "news.google.com" in hst) else 1.0
+        score = area * penalty
+
+        best_area, _ = best.get(src, (0, None))
+        if score > best_area:
+            best[src] = (score, img)
+
+    for src in ("publisher", "rss", "gnews"):
+        if best[src][1] is not None:
+            return best[src][1]
+    return None
 
 # ---------------- Typography & layout ----------------
 def load_fonts():
@@ -352,19 +389,24 @@ def main():
 
     title, gnews_link = newest["title"], newest["link"]
 
-    # 1) Publisher page + og/image/json-ld
-    page_url, soup    = resolve_canonical(gnews_link)
-    publisher         = publisher_from_link(page_url)
-    pub_img_url       = extract_og_like(page_url, soup)
+    # 1) Publisher page + rich extraction
+    page_url, soup = resolve_canonical(gnews_link)
+    publisher      = publisher_from_link(page_url)
+    pub_img_url    = extract_og_like(page_url, soup)
 
     # 2) RSS media thumbnail
-    rss_img_url       = newest.get("rss_media_url")
+    rss_img_url    = newest.get("rss_media_url")
 
-    # 3) Google News page thumbnail (fallback)
-    gnews_img_url     = extract_gnews_thumbnail(gnews_link)
+    # 3) Google News page fallback
+    gnews_img_url  = extract_gnews_thumbnail(gnews_link)
 
-    # Pick best
-    bg_img = pick_best_image([pub_img_url, rss_img_url, gnews_img_url])
+    # Priority-based pick
+    candidates = [
+        (pub_img_url,   "publisher"),
+        (rss_img_url,   "rss"),
+        (gnews_img_url, "gnews"),
+    ]
+    bg_img = pick_best_image(candidates)
 
     # Render poster
     ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
