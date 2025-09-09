@@ -1,4 +1,0 @@
-on:
-  workflow_dispatch:   # सिर्फ manual run बचेगा
-  # schedule:
-  #   - cron: "*/30 * * * *"
