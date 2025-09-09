@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM.
-Fixes: resolve Google News redirect to publisher page and fetch real og:image.
-Rejects Google thumbnails (news.google.com/gstatic/googleusercontent).
+Google News → Latest only → TEXT on TOP, ARTICLE IMAGE at BOTTOM (Google News style).
 
-ENV (optional):
-  NEWS_QUERY        e.g., "technology"  (empty => Top Stories)
-  MAX_AGE_MINUTES   freshness window in minutes (default 60)
+Highlights:
+- Top Stories (India) or NEWS_QUERY search
+- Freshness gate via MAX_AGE_MINUTES (default 60)
+- Duplicate prevention via out/last_id.json (robust even if file is empty/corrupt)
+- Manual override via headline.txt
+- Resolves Google News link to publisher page, extracts real og:image
+- Also considers RSS media thumbnail; chooses the better/larger image
+- Filters out logos/icons/placeholders; skips tiny images
+- No URL printed on poster; subline shows "Publisher • Local Time (IST)"
 """
 
 import os, io, sys, json, hashlib, datetime as dt
@@ -19,7 +23,7 @@ from bs4 import BeautifulSoup
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from slugify import slugify
 
-# ---------- Config ----------
+# ---------------- Config ----------------
 OUT_DIR       = "out"
 STATE_PATH    = os.path.join(OUT_DIR, "last_id.json")
 OVERRIDE_PATH = "headline.txt"
@@ -36,21 +40,34 @@ MAX_AGE_MINUTES  = int(os.getenv("MAX_AGE_MINUTES", str(DEFAULT_MAX_AGE_MIN)))
 GN_TOP    = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
 GN_SEARCH = lambda q: f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
 
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      "Accept-Language": "en-IN,en;q=0.9"}
+UA = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-IN,en;q=0.9"
+}
 
-REJECT_HOSTS = {"news.google.com", "googleusercontent.com", "gstatic.com", "gvt1.com"}
+# Reject these hostnames when deciding if an image is generic/Google proxy
+REJECT_HOSTS = {"gvt1.com"}
 
-# ---------- Utils ----------
+# Generic-looking image URL hints
+BAD_IMG_HINTS = ("logo", "icon", "placeholder", "default", "sprite", "branding")
+
+# ---------------- Utils ----------------
 def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
 
 def load_state():
-    if os.path.exists(STATE_PATH):
+    """Return {} if last_id.json is missing/empty/corrupt."""
+    try:
+        if not os.path.exists(STATE_PATH):
+            return {}
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            data = f.read().strip()
+            if not data:
+                return {}
+            return json.loads(data)
+    except Exception:
+        return {}
 
 def save_state(s):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -74,14 +91,11 @@ def publisher_from_link(link: str) -> str:
     except Exception:
         return ""
 
-def is_rejected_image(url: str) -> bool:
-    try:
-        host = urlparse(url).netloc.lower()
-        return any(h in host for h in REJECT_HOSTS)
-    except Exception:
-        return True
+def looks_generic_url(u: str) -> bool:
+    u = (u or "").lower()
+    return any(h in u for h in BAD_IMG_HINTS)
 
-# ---------- Fetch from Google News ----------
+# ---------------- Fetch: Google News ----------------
 def fetch_gn_entries(max_items=12):
     url = GN_SEARCH(NEWS_QUERY) if NEWS_QUERY else GN_TOP
     d = feedparser.parse(url)
@@ -90,9 +104,15 @@ def fetch_gn_entries(max_items=12):
         title = (e.get("title") or "").strip()
         link  = (e.get("link")  or "").strip()
         pub   = parse_dt(e.get("published") or e.get("updated") or e.get("pubDate"))
-        # Some feeds include generic thumbnails; we won't trust them anymore.
+        # keep RSS media candidate too
+        media_url = None
+        if "media_content" in e and e.media_content:
+            media_url = e.media_content[0].get("url")
+        if not media_url and "media_thumbnail" in e and e.media_thumbnail:
+            media_url = e.media_thumbnail[0].get("url")
         entries.append({
-            "title": title, "link": link, "published_at": pub
+            "title": title, "link": link, "published_at": pub,
+            "rss_media_url": media_url
         })
     return entries
 
@@ -102,17 +122,14 @@ def pick_newest(entries):
     valid.sort(key=lambda x: x["published_at"], reverse=True)
     return valid[0]
 
-# ---------- Resolve to publisher & scrape og:image ----------
+# ---------------- Resolve & extract image ----------------
 def resolve_canonical(url: str, timeout=12):
-    """
-    Follow the Google News redirect to the publisher article.
-    Returns (final_url, soup) where final_url is publisher domain.
-    """
+    """Follow Google News redirect to publisher article URL; return (final_url, soup)."""
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
-        final_url = r.url  # after redirects
+        final_url = r.url
         soup = BeautifulSoup(r.text, "html.parser")
-        # Prefer <link rel="canonical"> or og:url if present
+        # Canonical/og:url improve final_url accuracy
         can = soup.find("link", rel="canonical")
         if can and can.get("href"):
             final_url = urljoin(final_url, can["href"])
@@ -125,63 +142,78 @@ def resolve_canonical(url: str, timeout=12):
         return url, None
 
 def extract_best_image(page_url: str, soup: BeautifulSoup | None, timeout=12):
-    """
-    Try multiple selectors to get a good article image from publisher page.
-    Rejects Google/GNews thumbnails.
-    """
-    # 1) from given soup
+    """Try og:image / twitter:image / image_src / first <img> on publisher page."""
     def from_soup(sp: BeautifulSoup):
         if not sp: return None
-        # try common meta tags
-        for attr, val in (("property","og:image"),
-                          ("property","og:image:secure_url"),
-                          ("name","twitter:image"),
-                          ("property","twitter:image"),
-                          ("rel","image_src")):
-            if attr == "rel":
-                tag = sp.find("link", rel="image_src")
-                if tag and tag.get("href"):
-                    return urljoin(page_url, tag["href"])
-            else:
-                tag = sp.find("meta", {attr: val})
-                if tag and tag.get("content"):
-                    return urljoin(page_url, tag["content"])
-        # sometimes <figure><img>
+        for attr, val in (
+            ("property","og:image"),
+            ("property","og:image:secure_url"),
+            ("name","twitter:image"),
+            ("property","twitter:image"),
+        ):
+            tag = sp.find("meta", {attr: val})
+            if tag and tag.get("content"):
+                return urljoin(page_url, tag["content"])
+        tag = sp.find("link", rel="image_src")
+        if tag and tag.get("href"):
+            return urljoin(page_url, tag["href"])
         img = sp.find("img")
         if img and img.get("src"):
             return urljoin(page_url, img["src"])
         return None
 
     img_url = from_soup(soup)
-    if img_url and not is_rejected_image(img_url):
+    if img_url:
         return img_url
 
-    # 2) fetch page again if needed (some sites lazy-load on first request)
     try:
         r = requests.get(page_url, headers=UA, timeout=timeout)
         if r.status_code == 200:
             sp = BeautifulSoup(r.text, "html.parser")
             img_url = from_soup(sp)
-            if img_url and not is_rejected_image(img_url):
+            if img_url:
                 return img_url
     except Exception:
         pass
-
     return None
 
 def download_image(url: str, timeout=12):
     try:
+        # Reject obvious infra hosts
+        if url and urlparse(url).netloc.lower() in REJECT_HOSTS:
+            return None
+        if looks_generic_url(url):
+            return None
         r = requests.get(url, timeout=timeout, stream=True, headers=UA)
-        if r.status_code != 200: return None
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        return img
+        if r.status_code != 200:
+            return None
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
     except Exception:
         return None
 
 def aspect_fit_fill(img: Image.Image, size):
     return ImageOps.fit(ImageOps.exif_transpose(img), size, method=Image.LANCZOS, centering=(0.5,0.5))
 
-# ---------- Typography & layout ----------
+def pick_best_image(urls):
+    """Download candidates; prefer the largest area; skip logos/placeholders and tiny images."""
+    best = None; best_area = 0
+    for u in urls:
+        if not u:
+            continue
+        if looks_generic_url(u):
+            continue
+        img = download_image(u)
+        if img is None:
+            continue
+        w, h = img.size
+        if w < 400 or h < 300:     # too small => likely logo/icon
+            continue
+        area = w * h
+        if area > best_area:
+            best, best_area = img, area
+    return best
+
+# ---------------- Typography & layout ----------------
 def load_fonts():
     try:
         h1   = ImageFont.truetype("DejaVuSans-Bold.ttf", 62)
@@ -211,7 +243,7 @@ def render_layout(headline: str, publisher: str, pub_time_local: str, bg_img: Im
     draw   = ImageDraw.Draw(canvas)
     h1, body, meta = load_fonts()
 
-    # TOP area
+    # TOP band
     draw.rectangle((0,0,IMG_W,TOP_H), fill=(34,40,60))
     title_txt = "TOP STORY"
     tw = draw.textlength(title_txt, font=h1)
@@ -231,7 +263,7 @@ def render_layout(headline: str, publisher: str, pub_time_local: str, bg_img: Im
 
     draw.line((PADDING, TOP_H, IMG_W - PADDING, TOP_H), fill=(90,100,125), width=2)
 
-    # Bottom image
+    # BOTTOM image
     bottom_h = IMG_H - TOP_H
     if bg_img is not None:
         photo = aspect_fit_fill(bg_img, (IMG_W, bottom_h))
@@ -246,11 +278,10 @@ def render_layout(headline: str, publisher: str, pub_time_local: str, bg_img: Im
     fw = draw.textlength(footer, font=meta)
     draw.text(((IMG_W - fw)/2, IMG_H - 48), footer, fill=(210,215,230), font=meta)
 
-    buf = io.BytesIO()
-    canvas.save(buf, format="PNG", optimize=True)
+    buf = io.BytesIO(); canvas.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
-# ---------- Main ----------
+# ---------------- Main ----------------
 def main():
     ensure_dirs()
     state = load_state()
@@ -280,7 +311,8 @@ def main():
         print(f"STALE_NEWS_SKIP age={age_min:.1f} min (> {MAX_AGE_MINUTES})"); return
 
     title, gnews_link = newest["title"], newest["link"]
-    # Resolve Google News article to publisher page
+
+    # Resolve Google News → publisher
     page_url, soup = resolve_canonical(gnews_link)
     publisher = publisher_from_link(page_url)
 
@@ -288,13 +320,12 @@ def main():
     if state.get("last_id") == nid:
         print("DUPLICATE_SKIP"); return
 
-    # Find real article image on publisher page
-    img_url = extract_best_image(page_url, soup)
-    bg_img  = None
-    if img_url and not is_rejected_image(img_url):
-        bg_img = download_image(img_url)
+    # IMAGE: publisher og:image + RSS media → pick best
+    pub_img_url = extract_best_image(page_url, soup)
+    rss_img_url = newest.get("rss_media_url")
+    bg_img = pick_best_image([pub_img_url, rss_img_url])
 
-    # Render
+    # Render poster
     ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
     pub_local = pub.astimezone(ist).strftime("%I:%M %p")
     png = render_layout(title, publisher, pub_local, bg_img)
@@ -303,10 +334,11 @@ def main():
     fpath = os.path.join(OUT_DIR, fname)
     open(fpath, "wb").write(png)
 
+    # Save state
     state.update({
         "last_id": nid,
         "last_title": title,
-        "last_link": page_url,                 # store publisher URL
+        "last_link": page_url,   # store publisher URL (not gnews)
         "last_published_utc": pub.isoformat() if pub else "",
         "query": NEWS_QUERY or "top_stories",
         "max_age_minutes": MAX_AGE_MINUTES
@@ -316,7 +348,7 @@ def main():
     print(f"[OK] Fresh image saved: {fpath}")
     print(f"[INFO] Title: {title}")
     print(f"[INFO] Publisher URL: {page_url}")
-    print(f"[INFO] Image URL: {img_url if img_url else 'None'}")
+    print(f"[INFO] RSS Media: {rss_img_url}")
     print(f"[INFO] Age: {age_min:.1f} minutes")
 
 if __name__ == "__main__":
