@@ -1,8 +1,8 @@
-name: Generate Market Poster (Image Only)
+name: Generate Market Poster (Latest Only)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # हर 1 घंटे; चाहें तो बदलें
+    - cron: "*/30 * * * *"  # हर 30 मिनट (UTC). चाहें तो 15/20 भी कर सकते हैं
   workflow_dispatch: {}
 
 permissions:
@@ -11,6 +11,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      MAX_AGE_MINUTES: "60"     # 👈 खबर इससे पुरानी हुई तो इमेज नहीं बनेगी
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,14 +21,17 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - run: |
-          python generate_post.py
+      - name: Generate (fresh-only)
+        run: |
+          python generate_latest_post.py
+      - name: Commit fresh image (if any)
+        run: |
           if [ -n "$(git status --porcelain out/)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add out/
-            git commit -m "chore: add generated image"
+            git commit -m "chore: add fresh image"
             git push
           else
-            echo "No new image to commit."
+            echo "Nothing to commit (no fresh news or duplicate)."
           fi
