@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Google News → Latest only → Poster with article image background.
+Google News → Latest only → Poster with TEXT on TOP and ARTICLE IMAGE BELOW.
 - Source: Google News Top Stories (India) OR search via NEWS_QUERY
 - Freshness gate via MAX_AGE_MINUTES (default 60)
 - Duplicate prevention via out/last_id.json
 - Manual override via headline.txt (skips freshness/dup check)
-- Pulls article image from RSS media tags or falls back to page og:image
-- Renders full-bleed image with dark overlay + readable text
-
-ENV (optional):
-  NEWS_QUERY        e.g., "technology" or "nepal protests"  (empty => Top Stories)
-  MAX_AGE_MINUTES   default "60"
+- Fetches article image from RSS media tags or page og:image
+- Layout: 1080x1350 portrait
+    ┌──────────────────────────┐
+    │  TOP AREA (headline +    │  ~520 px
+    │  publisher • local time) │
+    ├──────────────────────────┤  divider
+    │  BOTTOM: ARTICLE IMAGE   │  fills remaining height
+    └──────────────────────────┘
 """
 
 import os, io, sys, json, hashlib, datetime as dt
@@ -24,21 +26,23 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 from slugify import slugify
 
 # ---------- Config ----------
-OUT_DIR = "out"
-STATE_PATH = os.path.join(OUT_DIR, "last_id.json")
+OUT_DIR       = "out"
+STATE_PATH    = os.path.join(OUT_DIR, "last_id.json")
 OVERRIDE_PATH = "headline.txt"
 
-IMG_W, IMG_H = 1080, 1350
-HEADLINE_WRAP_LEN = 160
-DEFAULT_MAX_AGE_MIN = 60
+IMG_W, IMG_H         = 1080, 1350
+TOP_H                = 520           # headline area height
+PADDING              = 56
+HEADLINE_WRAP_LEN    = 170
+DEFAULT_MAX_AGE_MIN  = 60
 
-NEWS_QUERY = os.getenv("NEWS_QUERY", "").strip()
-MAX_AGE_MINUTES = int(os.getenv("MAX_AGE_MINUTES", str(DEFAULT_MAX_AGE_MIN)))
+NEWS_QUERY       = os.getenv("NEWS_QUERY", "").strip()
+MAX_AGE_MINUTES  = int(os.getenv("MAX_AGE_MINUTES", str(DEFAULT_MAX_AGE_MIN)))
 
-GN_TOP = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
+GN_TOP    = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
 GN_SEARCH = lambda q: f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
 
-# ---------- Helpers ----------
+# ---------- Utils ----------
 def ensure_dirs():
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -49,7 +53,7 @@ def load_state():
     return {}
 
 def save_state(s):
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
+    with open(STATE_PATH, "w", encoding="utf-8") as f):
         json.dump(s, f, ensure_ascii=False, indent=2)
 
 def parse_dt(s):
@@ -65,12 +69,12 @@ def publisher_from_link(link: str) -> str:
     try:
         host = urlparse(link).netloc
         if host.startswith("www."): host = host[4:]
-        # prettify e.g. indiatoday.in -> IndiaToday
         base = host.split(".")[0]
         return base.replace("-", " ").title()
     except Exception:
         return ""
 
+# ---------- Fetch ----------
 def fetch_gn_entries(max_items=12):
     url = GN_SEARCH(NEWS_QUERY) if NEWS_QUERY else GN_TOP
     d = feedparser.parse(url)
@@ -79,16 +83,13 @@ def fetch_gn_entries(max_items=12):
         title = (e.get("title") or "").strip()
         link  = (e.get("link")  or "").strip()
         pub   = parse_dt(e.get("published") or e.get("updated") or e.get("pubDate"))
-        # Try to grab image from RSS media tags
         media_url = None
         if "media_content" in e and e.media_content:
-            # feedparser gives list[{'url':...}]
             media_url = e.media_content[0].get("url")
         if not media_url and "media_thumbnail" in e and e.media_thumbnail:
             media_url = e.media_thumbnail[0].get("url")
         entries.append({
-            "title": title, "link": link, "published_at": pub,
-            "media_url": media_url,
+            "title": title, "link": link, "published_at": pub, "media_url": media_url,
             "source_title": (getattr(e, "source", {}) or {}).get("title", "")
         })
     return entries
@@ -99,7 +100,41 @@ def pick_newest(entries):
     valid.sort(key=lambda x: x["published_at"], reverse=True)
     return valid[0]
 
-def short(t, n): return t if len(t) <= n else t[:n-1] + "…"
+# ---------- Image helpers ----------
+def get_og_image(url: str, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code != 200: return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        for prop in ("og:image","twitter:image","og:image:url"):
+            tag = soup.find("meta", property=prop)
+            if tag and tag.get("content"): return tag["content"]
+        return None
+    except Exception:
+        return None
+
+def download_image(url: str, timeout=12):
+    try:
+        r = requests.get(url, timeout=timeout, stream=True, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code != 200: return None
+        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        return img
+    except Exception:
+        return None
+
+def aspect_fit_fill(img: Image.Image, size):
+    # cover (center-crop) to exactly fill given size
+    return ImageOps.fit(ImageOps.exif_transpose(img), size, method=Image.LANCZOS, centering=(0.5,0.5))
+
+# ---------- Typography ----------
+def load_fonts():
+    try:
+        h1   = ImageFont.truetype("DejaVuSans-Bold.ttf", 62)
+        body = ImageFont.truetype("DejaVuSans.ttf", 40)
+        meta = ImageFont.truetype("DejaVuSans.ttf", 30)
+    except:
+        h1 = body = meta = ImageFont.load_default()
+    return h1, body, meta
 
 def wrap_lines(draw, text, font, max_width):
     words = text.split()
@@ -114,85 +149,57 @@ def wrap_lines(draw, text, font, max_width):
     if line: lines.append(line)
     return lines
 
-# ---------- Image fetching ----------
-def get_og_image(url: str, timeout=10) -> str | None:
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code != 200: return None
-        soup = BeautifulSoup(r.text, "html.parser")
-        for prop in ("og:image","twitter:image","og:image:url"):
-            tag = soup.find("meta", property=prop)
-            if tag and tag.get("content"): return tag["content"]
-        return None
-    except Exception:
-        return None
+def short(t, n): return t if len(t) <= n else t[:n-1] + "…"
 
-def download_image(url: str, timeout=12) -> Image.Image | None:
-    try:
-        r = requests.get(url, timeout=timeout, stream=True, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code != 200: return None
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
-        return img
-    except Exception:
-        return None
+# ---------- Render (TEXT TOP, IMAGE BOTTOM) ----------
+def render_layout(headline: str, publisher: str, pub_time_local: str, bg_img: Image.Image | None):
+    canvas = Image.new("RGB", (IMG_W, IMG_H), (18,22,33))
+    draw   = ImageDraw.Draw(canvas)
+    h1, body, meta = load_fonts()
 
-def compose_with_bg(bg: Image.Image) -> Image.Image:
-    # Aspect-fill to 1080x1350, then add dark overlay
-    bg = ImageOps.exif_transpose(bg)
-    bg = ImageOps.fit(bg, (IMG_W, IMG_H), method=Image.LANCZOS, bleed=0.0, centering=(0.5,0.5))
-    overlay = Image.new("RGBA", (IMG_W, IMG_H), (0,0,0,120))  # ~47% dark
-    bg = bg.convert("RGBA")
-    bg.alpha_composite(overlay)
-    return bg.convert("RGB")
+    # TOP area background
+    draw.rectangle((0,0,IMG_W,TOP_H), fill=(34,40,60))
 
-def render_poster(headline: str, subline: str, bg_img: Image.Image | None) -> bytes:
-    if bg_img is not None:
-        img = compose_with_bg(bg_img)
-        draw = ImageDraw.Draw(img)
-    else:
-        img = Image.new("RGB", (IMG_W, IMG_H), (18, 22, 33))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle((0,0,IMG_W,260), fill=(34,40,60))
+    # Title chip
+    title_txt = "TOP STORY"
+    tw = draw.textlength(title_txt, font=h1)
+    draw.text(((IMG_W - tw)/2, PADDING), title_txt, fill=(240,245,255), font=h1)
 
-    # Fonts
-    try:
-        h1   = ImageFont.truetype("DejaVuSans-Bold.ttf", 64)
-        body = ImageFont.truetype("DejaVuSans.ttf", 42)
-        meta = ImageFont.truetype("DejaVuSans.ttf", 28)
-    except:
-        h1 = body = meta = ImageFont.load_default()
-
-    # Heading
-    heading = "TOP STORY"
-    tw = draw.textlength(heading, font=h1)
-    draw.text(((IMG_W - tw)/2, 90), heading, fill=(240,245,255), font=h1)
-
-    # Card outline (for non-image bg it looks like a card; on photo it's subtle)
-    draw.rounded_rectangle((36, 240, IMG_W-36, IMG_H-160), radius=36, outline=(220,225,235), width=2)
-
-    # Headline (wrapped)
-    margin = 90
+    # Headline (wrap)
+    maxw = IMG_W - 2*PADDING
     text = short(headline, HEADLINE_WRAP_LEN)
-    lines = wrap_lines(draw, text, body, IMG_W - 2*margin)
-    y = 320
+    lines = wrap_lines(draw, text, body, maxw)
+    y = PADDING + 90
     for ln in lines:
         lw = draw.textlength(ln, font=body)
-        draw.text(((IMG_W - lw)/2, y), ln, fill=(245,248,250), font=body)
-        y += 64
+        draw.text(((IMG_W - lw)/2, y), ln, fill=(235,238,245), font=body)
+        y += 58
 
-    # Subline
-    if subline:
-        sw = draw.textlength(subline, font=meta)
-        draw.text(((IMG_W - sw)/2, y+10), subline, fill=(230,233,240), font=meta)
+    # Publisher • time
+    sub = f"{publisher} • {pub_time_local}" if publisher else pub_time_local
+    sw = draw.textlength(sub, font=meta)
+    draw.text(((IMG_W - sw)/2, TOP_H - 80), sub, fill=(210,215,230), font=meta)
 
-    # Footer (IST)
+    # Divider
+    draw.line((PADDING, TOP_H, IMG_W - PADDING, TOP_H), fill=(90,100,125), width=2)
+
+    # BOTTOM image area
+    bottom_h = IMG_H - TOP_H
+    if bg_img is not None:
+        photo = aspect_fit_fill(bg_img, (IMG_W, bottom_h))
+        canvas.paste(photo, (0, TOP_H))
+    else:
+        # Placeholder gradient if no image
+        ph = Image.new("RGB", (IMG_W, bottom_h), (28,32,45))
+        canvas.paste(ph, (0, TOP_H))
+
+    # Footer
     ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
     footer = f"Auto-generated • {dt.datetime.now(ist).strftime('%d %b %Y, %I:%M %p IST')}"
     fw = draw.textlength(footer, font=meta)
-    draw.text(((IMG_W - fw)/2, IMG_H-110), footer, fill=(220,225,235), font=meta)
+    draw.text(((IMG_W - fw)/2, IMG_H - 48), footer, fill=(210,215,230), font=meta)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    buf = io.BytesIO(); canvas.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 # ---------- Main ----------
@@ -200,29 +207,27 @@ def main():
     ensure_dirs()
     state = load_state()
 
-    # Manual override (always allowed)
+    # Manual override
     if os.path.exists(OVERRIDE_PATH):
         txt = open(OVERRIDE_PATH, "r", encoding="utf-8").read().strip()
         if txt:
-            png = render_poster(txt, "Manual override", None)
+            png = render_layout(txt, "Manual", "--:--", None)
             fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(txt)[:48]}_manual.png"
-            path = os.path.join(OUT_DIR, fname)
+            path  = os.path.join(OUT_DIR, fname)
             open(path, "wb").write(png)
             state["last_id"] = "manual_" + hashlib.sha256(txt.encode()).hexdigest()[:16]
             save_state(state)
             print("[OK] Manual override image:", path)
             return
 
-    # Fetch newest Google News item
     entries = fetch_gn_entries()
-    newest = pick_newest(entries)
+    newest  = pick_newest(entries)
     if not newest:
         print("NO_NEWS_FOUND"); return
 
     pub = newest["published_at"]
     now = dt.datetime.now(dt.timezone.utc)
     age_min = (now - pub).total_seconds()/60.0 if pub else 9999
-
     if age_min > MAX_AGE_MINUTES:
         print(f"STALE_NEWS_SKIP age={age_min:.1f} min (> {MAX_AGE_MINUTES})"); return
 
@@ -231,31 +236,24 @@ def main():
     if state.get("last_id") == nid:
         print("DUPLICATE_SKIP"); return
 
-    # Publisher + local time for subline
+    # Publisher + local time
     publisher = newest.get("source_title") or publisher_from_link(link)
     ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
-    subline = f"{publisher} • {pub.astimezone(ist).strftime('%I:%M %p')}"
+    pub_local = pub.astimezone(ist).strftime("%I:%M %p")
 
-    # Try to fetch an image
-    bg_img = None
-    img_url = newest.get("media_url")
-    if not img_url:
-        img_url = get_og_image(link)
-    if img_url:
-        bg_img = download_image(img_url)
+    # Image fetch
+    img_url = newest.get("media_url") or get_og_image(link)
+    bg_img  = download_image(img_url) if img_url else None
 
     # Render
-    png = render_poster(title, subline, bg_img)
-
+    png   = render_layout(title, publisher, pub_local, bg_img)
     fname = f"{dt.datetime.now().strftime('%Y%m%d_%H%M')}_{slugify(title)[:48]}_{nid[:8]}.png"
     fpath = os.path.join(OUT_DIR, fname)
-    with open(fpath, "wb") as f: f.write(png)
+    open(fpath, "wb").write(png)
 
     # Save state
     state.update({
-        "last_id": nid,
-        "last_title": title,
-        "last_link": link,
+        "last_id": nid, "last_title": title, "last_link": link,
         "last_published_utc": pub.isoformat() if pub else "",
         "query": NEWS_QUERY or "top_stories",
         "max_age_minutes": MAX_AGE_MINUTES
@@ -265,7 +263,6 @@ def main():
     print(f"[OK] Fresh image saved: {fpath}")
     print(f"[INFO] Title: {title}")
     print(f"[INFO] Publisher: {publisher}")
-    print(f"[INFO] Link: {link}")
     print(f"[INFO] Age: {age_min:.1f} minutes")
 
 if __name__ == "__main__":
