@@ -53,7 +53,7 @@ def load_state():
     return {}
 
 def save_state(s):
-    with open(STATE_PATH, "w", encoding="utf-8") as f):
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
 
 def parse_dt(s):
